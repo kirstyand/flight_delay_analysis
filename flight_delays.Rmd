@@ -1,0 +1,2986 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Load Libraries & Data
+
+```{r}
+library(tidyverse)
+library(here)
+library(GGally)
+library(rpart)
+library(rpart.plot)
+library(ranger)
+library(broom)
+library(caret)
+library(leaflet)
+library(sf)
+library(pROC)
+library(modelr)
+library(ggfortify)
+library(RColorBrewer)
+library(mosaic)
+```
+
+```{r}
+# check files in folder
+
+list.files(path = "data/", pattern = ".csv")
+```
+
+
+```{r}
+# write function to read in csv files, automate name
+
+read_all_csv_fn <- function(data_path){
+  files <- list.files(path = data_path, pattern = ".csv") # create list of files in given path
+  for(file in files){ # take each of these listed files in turn
+    file_path <- file.path(data_path, file) # create full path of file
+    new_file <- read_csv(file_path) #read csv using new path
+    new_file_name <- str_remove(file, "(\\.)(csv)") %>%  # name csv by removing file ext
+      str_replace_all("[-]", "_")
+    #replace any dashes with underscores
+    assign(new_file_name, new_file, envir = .GlobalEnv) #assing csv name to csv file save to global env.
+  }
+}
+```
+
+```{r}
+# use new function to read in data
+read_all_csv_fn("data/")
+```
+
+# Cleaning
+
+```{r}
+# familiarise with data
+
+airlines
+airports
+flights
+planes
+weather
+
+```
+
+- column names all look to be in snake_case already
+- check for NA:
+```{r}
+# check for NA values across all dataframes
+
+summarise(airlines, across(everything(), ~ sum(is.na(.))))
+
+summarise(airports, across(everything(), ~ sum(is.na(.))))
+
+summarise(flights, across(everything(), ~ sum(is.na(.))))
+
+summarise(planes, across(everything(), ~ sum(is.na(.))))
+
+summarise(weather, across(everything(), ~ sum(is.na(.))))
+```
+
+
+- flights and weather look to be the most useful datasets, clean and join these first
+```{r}
+flights %>% 
+  distinct(dep_time) # assume that any NA dep_time and arr_time values were as a result of cancelled flights
+
+flights %>% 
+  distinct(dep_delay) %>% 
+  arrange(dep_delay) # assume that NA dep_delay or arr_delay means flight was cancelled (0 value means no delay)
+
+flights %>% 
+  filter(is.na(tailnum)) %>% 
+  arrange(dep_time) # assume NA tailnums were cancelled since no dep_time too
+
+flights %>% 
+  filter(is.na(air_time)) %>% 
+  arrange(dep_time) # no clear reason at this point why we have air_time NA, leave for now
+
+# so from flights we can drop NA from dep_time, arr_time, dep_delay, arr_delay, and tailnum as we assume these come from cancelled flights
+
+flights_clean <- flights %>% 
+  drop_na(dep_time, dep_delay, arr_delay, tailnum, dep_time, arr_time)
+
+summarise(flights_clean, across(everything(), ~ sum(is.na(.)))) # this seems to have cleared up air_time too
+```
+
+
+```{r}
+# might be useful to have a route column
+# join flight dep and arrival airports into a route
+
+(flights_clean <- flights_clean %>% 
+   unite("route", c("origin", "dest"), sep = "_", remove = FALSE)
+) 
+```
+
+## Create Binary Columns
+
+```{r}
+# create binary column for delayed departure 
+
+(flights_clean <- flights_clean %>% 
+   mutate(delayed_dep = if_else(dep_delay > 0, TRUE, FALSE), .after = dep_delay)
+)
+```
+
+
+```{r}
+# create binary column for delayed arrival
+
+(flights_clean <- flights_clean %>% 
+   mutate(delayed_arr = if_else(arr_delay > 0, TRUE, FALSE), .after = arr_delay)
+)
+```
+
+```{r}
+# check how many years we have data for
+
+flights_clean %>% 
+  distinct(year)
+
+# remove year column since only one year
+
+(flights_clean <- flights_clean %>% 
+    select(- year)
+)
+```
+
+
+
+```{r}
+weather %>% 
+  distinct(temp)
+weather %>% 
+  filter(is.na(temp)) # assume that weather NAs come from misreadings, they can't mean 0 as this would be recorded as 0
+
+weather_clean <- weather %>% 
+  drop_na(temp:visib)
+
+summarise(weather_clean, across(everything(), ~ sum(is.na(.))))
+
+```
+
+```{r}
+# check how many years weather we have, we only need 2017
+weather_clean %>% 
+  distinct(year)
+
+# remove year column as we only have 1 year
+(weather_clean <- weather_clean %>% 
+    select(-(year))
+)
+```
+
+```{r}
+# Check that all origin airports and weather airports are the same 
+weather_clean %>% 
+  distinct(origin)
+
+flights_clean %>% 
+  distinct(origin)
+```
+
+```{r}
+# in order to join, need to create a column that has airport and date in both weather and flights data
+# first, create new column called m_d_h which holds the month/day_hour
+
+(weather_clean <- weather_clean %>% 
+   mutate(m_d_h = strftime(time_hour, format ="%m/%d_%H")) %>% 
+   # then unite m_d_h with the origin airport
+   unite(airp_date, c("origin", "m_d_h"), remove = FALSE) %>% 
+   # we now don't need the original month, day, or hour columns
+   # (these were problematic to use as the leading 0s had been stripped
+   # also remove time_hour for now as it may be a problem in the join
+   select(-c("month", "day", "hour", "m_d_h"))
+)
+```
+
+```{r}
+# follow the same code as above but for flights
+
+(flights_clean <- flights_clean %>% 
+   mutate(m_d_h = strftime(time_hour, format ="%m/%d_%H")) %>% 
+   # then unite m_d_h with the origin airport
+   unite(airp_date, c("origin", "m_d_h"), remove = FALSE) %>% 
+   # we now don't need the original month, day, or hour columns
+   # (these were problematic to use as the leading 0s had been stripped
+   # also remove time_hour for now as it may be a problem in the join
+   select(-c("month", "day", "hour", "m_d_h"))
+)
+```
+
+```{r}
+# join on new column
+(flights_weather <-inner_join(flights_clean, weather_clean, by = "airp_date") %>% 
+   select(-origin.y,- time_hour.y) %>%
+   rename("origin" = "origin.x",
+          "time_hour" = "time_hour.x")
+ 
+)
+```
+
+```{r}
+# check for NA after join
+
+summarise(flights_weather, across(everything(), ~ sum(is.na(.))))
+```
+
+## Create ranges:
+
+As a lot of data is numerical and I want to run a logical regression, create groups for numerical data types:
+
+### Temperature
+
+```{r}
+flights_weather %>% 
+  distinct(temp) %>% 
+  arrange(temp)
+```
+
+```{r}
+# lowest ever global temp = -128.6°F, highest = 134°F
+# turn temp into 10°F ranges between 
+# use most extreme temperatures in case data set changes
+(flights_weather <- flights_weather %>% 
+   mutate(temp_range = case_when(temp <0 ~ "<0",
+                                 temp >= 0 & temp < 10 ~ "0-10",
+                                 temp >= 10 & temp < 20  ~ "10-20",
+                                 temp >= 20 & temp < 30 ~ "20-30",
+                                 temp >= 30 & temp < 40 ~ "30-40",
+                                 temp >= 40 & temp < 50 ~ "40-50",
+                                 temp >= 50 & temp < 60 ~ "50-60",
+                                 temp >= 60 & temp < 70 ~ "60-70",
+                                 temp >= 70 & temp < 80 ~ "70-79",
+                                 temp >= 80 & temp < 90 ~ "80-89",
+                                 temp >= 90 & temp < 100 ~ "90-100",
+                                 temp >= 100 ~ ">100",
+                                 TRUE ~ as.character(temp )), .after = temp)
+)
+
+flights_weather %>% 
+  distinct(temp_range)
+```
+
+### Precipitation
+
+```{r}
+flights_weather %>% 
+  distinct(precip) %>% 
+  arrange(desc(precip))
+```
+- Mutate `precip` into the following ranges (in inches):
+- 0 - 0.05
+- 0.05 - 0.1
+- 0.1 - 0.15
+- 0.15 -0.2
+- > 0.2
+
+
+```{r}
+(flights_weather <- flights_weather %>% 
+   mutate(precip_range = case_when(precip == 0.00 ~ "0.00",
+                                   precip > 0.00 & precip < 0.05 ~ "0.00 - 0.05",
+                                   precip >= 0.05 & precip < 0.10 ~ "0.05 - 0.10",
+                                   precip >= 0.10 & precip < 0.15 ~ "0.10 - 0.15",
+                                   precip >= 0.15 & precip < 0.20 ~ "0.15 - 0.20",
+                                   precip >= 0.20 ~ "> 0.20",
+                                   TRUE ~ as.character(precip)),
+          .after = precip)
+)
+
+flights_weather %>% 
+  distinct(precip_range)
+```
+
+### Wind
+
+```{r}
+# wind direction (degrees)
+flights_weather %>% 
+  distinct(wind_dir) %>% 
+  arrange(desc(wind_dir))
+
+# wind speed (mph)
+flights_weather %>% 
+  distinct(wind_speed) %>% 
+  arrange(desc(wind_speed))
+
+# wind gust (mph)
+flights_weather %>% 
+  distinct(wind_gust) %>% 
+  arrange(desc(wind_gust))
+```
+
+"A sustained wind is defined as the average wind speed over two minutes. A sudden burst in wind speed is called the wind gust and typically lasts under 20 seconds."
+
+create ranges for wind direction, wind speed, and wind gust
+
+- wind direction:
+assumption/generalisation:
+0°  - 45° = north
+46° - 135° = east
+136° - 225° = south
+226° - 315° = west
+316° - 360° = north
+
+
+```{r}
+(flights_weather <- flights_weather %>% 
+   mutate(wind_dir_range = case_when(wind_dir >= 0 & wind_dir <=45 ~ "North",
+                                     wind_dir > 45 & wind_dir <= 135 ~ "East",
+                                     wind_dir > 135 & wind_dir <= 225 ~ "South",
+                                     wind_dir > 225 & wind_dir <= 315 ~ "West",
+                                     wind_dir > 315 & wind_dir <= 360 ~ "North",
+                                     TRUE ~ as.character(wind_dir)),
+          .after = wind_dir)
+)
+
+flights_weather %>% 
+  distinct(wind_dir_range)
+```
+
+- wind speed
+
+wind speed ranges from 0 - 39, do ranges of 10
+0 - 10
+11 - 20
+21- 30
+31 - 40
+40 - 50 (to match wind gust)
+> 50
+
+```{r}
+(flights_weather <- flights_weather %>% 
+   mutate(wind_speed_range = case_when(wind_speed >= 0 & wind_speed <=10 ~ "0 - 10",
+                                       wind_speed > 10 & wind_speed <= 20 ~ "10 - 20",
+                                       wind_speed > 20 & wind_speed <= 30 ~ "20 - 30",
+                                       wind_speed > 30 & wind_speed <= 40 ~ "30 - 40",
+                                       wind_speed > 40 ~ ">40",
+                                       TRUE ~ as.character(wind_speed)),
+          .after = wind_speed)
+)
+
+flights_weather %>% 
+  distinct(wind_speed_range)
+
+```
+
+
+- wind gust 
+
+wind gust ranges from 0 - 45:
+0 - 10
+11 - 20
+21- 30
+31 - 40
+40 - 50 
+> 50
+
+```{r}
+
+(flights_weather <- flights_weather %>% 
+   mutate(wind_gust_range = case_when(wind_gust >= 0 & wind_gust <=10 ~ "0 - 10",
+                                      wind_gust > 10 & wind_gust <= 20 ~ "10 - 20",
+                                      wind_gust > 20 & wind_gust <= 30 ~ "20 - 30",
+                                      wind_gust > 30 & wind_gust <= 40 ~ "30 - 40",
+                                      wind_gust > 40 ~ ">40",
+                                      TRUE ~ as.character(wind_gust)),
+          .after = wind_gust)
+)
+
+flights_weather %>% 
+  distinct(wind_gust_range)
+
+```
+
+### Visibility
+
+```{r}
+# visibility (miles)
+
+flights_weather %>% 
+  distinct(visib) %>% 
+  arrange(desc(visib))
+```
+
+ranges from 0.12 - 10, with quite a lot of variation from 0.12 - 2.5
+the lower the visibility number, the worse the weather is so want to keep this low level detail
+** nb come back and change if e.g. >5m vis is normally good
+<1
+1-2
+2-3
+3-4
+4-5
+5-6
+6-7
+7-8
+8-9
+9-10
+>10
+
+
+```{r}
+
+
+(flights_weather <- flights_weather %>% 
+   mutate(visib_range = case_when(visib < 1 ~ "< 1",
+                                  visib >= 1 & visib <= 2 ~ "1 - 2",
+                                  visib > 2 & visib <= 3 ~ "2 - 3",
+                                  visib > 3 & visib <= 4 ~ "3 - 4",
+                                  visib > 4 & visib <= 5 ~ "4 - 5",
+                                  visib > 5 & visib <= 6 ~ "5 - 6",
+                                  visib > 6 & visib <= 7 ~ "6 - 7",
+                                  visib > 7 & visib <= 8 ~ "7 - 8",
+                                  visib > 8 & visib <= 9 ~ "8 - 9",
+                                  visib > 9 & visib <= 10 ~ "9 - 10",
+                                  visib > 10 ~ ">10",
+                                  TRUE ~ as.character(visib)),
+          .after = visib)
+)
+
+flights_weather %>% 
+  distinct(visib_range)
+
+```
+
+
+### Humidity
+
+```{r}
+flights_weather %>% 
+  distinct(humid) %>% 
+  arrange(desc(humid))
+
+```
+
+humidity range is 11.76 - 100
+< 10
+10 - 20
+20 - 30
+30 - 40
+40 - 50
+50 - 60
+60 - 70
+70 - 80
+80 - 90
+90 - 100
+
+```{r}
+
+(flights_weather <- flights_weather %>% 
+   mutate(humid_range = case_when(humid < 10 ~ "< 10",
+                                  humid >= 10 & humid <= 20 ~ "10 - 20",
+                                  humid > 20 & humid <= 30 ~ "20 - 30",
+                                  humid > 30 & humid <= 40 ~ "30 - 40",
+                                  humid > 40 & humid <= 50 ~ "40 - 50",
+                                  humid > 50 & humid <= 60 ~ "50 - 60",
+                                  humid > 60 & humid <= 70 ~ "60 - 70",
+                                  humid > 70 & humid <= 80 ~ "70 - 80",
+                                  humid > 80 & humid <= 90 ~ "80 - 90",
+                                  humid > 90 & humid <= 100 ~ "90 - 100",
+                                  humid > 10 ~ ">100",
+                                  TRUE ~ as.character(humid)),
+          .after = humid)
+)
+
+flights_weather %>% 
+  distinct(humid_range)
+
+```
+
+### Pressure
+
+```{r}
+flights_weather %>% 
+  distinct(pressure) %>% 
+  arrange(desc(pressure))
+```
+
+pressure range is 915.9 - 1037.7
+<910
+930
+950
+970
+990
+1010
+1030
+1040
+>1040
+
+```{r}
+(flights_weather <- flights_weather %>% 
+   mutate(pressure_range = case_when(pressure < 910 ~ "< 910",
+                                     pressure >= 910 & pressure <= 930 ~ "910 - 930",
+                                     pressure > 930 & pressure <= 950 ~ "930 - 950",
+                                     pressure > 950 & pressure <= 970 ~ "950 - 970",
+                                     pressure > 970 & pressure <= 990 ~ "970 - 990",
+                                     pressure > 990 & pressure <= 1010 ~ "990 - 1010",
+                                     pressure > 1010 & pressure <= 1030 ~ "1010 - 1030",
+                                     pressure > 1030 & pressure <= 1050 ~ "1030 - 1050",
+                                     pressure > 1040 ~ ">1050",
+                                     TRUE ~ as.character(pressure)),
+          .after = pressure)
+)
+
+flights_weather %>% 
+  distinct(pressure_range)
+```
+
+### Dewpoint
+
+```{r}
+flights_weather %>% 
+  distinct(dewp) %>% 
+  arrange(desc(dewp))
+```
+
+
+dewp is 7 - 77
+
+0 - 10
+10 -20
+20-30
+30 - 40
+40-50
+50-60
+60-70
+70-80
+>80
+
+```{r}
+(flights_weather <- flights_weather %>% 
+   mutate(dewp_range = case_when(dewp < 0 ~ "< 0",
+                                 dewp >= 0 & dewp <= 10 ~ "0 - 10",
+                                 dewp > 10 & dewp <= 20 ~ "10 - 20",
+                                 dewp > 20 & dewp <= 30 ~ "20 - 30",
+                                 dewp > 30 & dewp <= 40 ~ "30 - 40",
+                                 dewp > 40 & dewp <= 50 ~ "40 - 50",
+                                 dewp > 50 & dewp <= 60 ~ "50 - 60",
+                                 dewp > 60 & dewp <= 70 ~ "60 - 70",
+                                 dewp > 70 & dewp <= 80 ~ "70 - 80",
+                                 dewp > 80 ~ ">80",
+                                 TRUE ~ as.character(dewp)),
+          .after = dewp)
+)
+
+flights_weather %>% 
+  distinct(dewp_range)
+```
+
+### Month & Hour
+
+```{r}
+(flights_weather <- flights_weather %>% 
+   mutate(month = month(time_hour),
+          hour = hour(time_hour))
+)
+
+```
+```{r}
+
+flights_clean <- flights_clean %>% 
+  mutate(dep_date = str_sub(time_hour, start = 0, end = 11),
+         dep_time = str_pad(dep_time, width = 4, side = "left", pad = 0),
+         dep_time_h = str_sub(dep_time, start = 0, end = 2),
+         dep_time_m = str_sub(dep_time, start = 3, end = 4),
+         dep_time_h = str_pad(dep_time_h, width = 3, side = "right", pad = ":"),
+         dep_time_m = paste0(dep_time_m, ":00"),
+         dep_time = as_datetime(paste0(dep_date, dep_time_h, dep_time_m)),
+         sched_dep_time = str_pad(sched_dep_time, width = 4, side = "left", pad = 0),
+         sched_dep_time_h = str_sub(sched_dep_time, start = 0, end = 2),
+         sched_dep_time_m = str_sub(sched_dep_time, start = 3, end = 4),
+         sched_dep_time_h = str_pad(sched_dep_time_h, width = 3, side = "right", pad = ":"),
+         sched_dep_time_m = paste0(sched_dep_time_m, ":00"),
+         sched_dep_time = as_datetime(paste0(dep_date, sched_dep_time_h, sched_dep_time_m))) %>% 
+  mutate(dep_hour = hour(dep_time),
+         dep_month = month(dep_time))
+```
+
+
+
+### Distance
+
+distance will need to be recoded into levels
+
+```{r}
+flights_clean %>% 
+  distinct(distance) %>% 
+  arrange(distance)
+```
+93 - 4962
+
+```{r}
+flights_weather %>% 
+  distinct(distance) %>% 
+  arrange(distance)
+```
+93 - 4962
+
+0 - 500
+500 - 1000
+1000 - 1500
+1500 - 2000
+2000 - 2500
+2500 - 3000
+3000 - 3500
+> 3500
+
+```{r}
+(flights_weather <- flights_weather %>% 
+   mutate(distance_range = case_when(distance == 0 ~ "<0",
+                                     distance >= 0 & distance < 500 ~ "0-500",
+                                     distance >= 500 & distance < 1000  ~ "500-1000",
+                                     distance >= 1000 & distance < 1500 ~ "1000-1500",
+                                     distance >= 1500 & distance < 2000 ~ "1500-2000",
+                                     distance >= 2000 & distance < 2500 ~ "2000-2500",
+                                     distance >= 2500 & distance < 3000 ~ "2500-3000",
+                                     distance >= 3000 & distance <= 3500 ~ "3000-3500",
+                                     distance > 3500 ~ "3500",
+                                     TRUE ~ as.character(distance)), .after = distance)
+)
+
+flights_weather %>% 
+  distinct(distance_range)
+```
+
+```{r}
+(flights_clean <- flights_clean %>% 
+   mutate(distance_range = case_when(distance == 0 ~ "<0",
+                                     distance >= 0 & distance < 500 ~ "0-500",
+                                     distance >= 500 & distance < 1000  ~ "500-1000",
+                                     distance >= 1000 & distance < 1500 ~ "1000-1500",
+                                     distance >= 1500 & distance < 2000 ~ "1500-2000",
+                                     distance >= 2000 & distance < 2500 ~ "2000-2500",
+                                     distance >= 2500 & distance < 3000 ~ "2500-3000",
+                                     distance >= 3000 & distance <= 3500 ~ "3000-3500",
+                                     distance > 3500 ~ "3500",
+                                     TRUE ~ as.character(distance)), .after = distance)
+)
+
+flights_clean %>% 
+  distinct(distance_range)
+```
+
+
+
+### Planes
+
+```{r}
+planes %>% 
+  distinct(type)
+
+planes %>% 
+  distinct(manufacturer)
+
+planes %>% 
+  distinct(engine)
+
+planes %>% 
+  distinct(year)
+
+summarise(planes, across(everything(), ~ sum(is.na(.))))
+```
+
+
+```{r}
+(flights_planes <- inner_join(flights_clean, planes, by = "tailnum") %>% 
+   filter(year > 0) %>% 
+   drop_na(year) %>% 
+   mutate(plane_age = (2017 - year), # all datasets from 2017
+          plane_type = type)
+ 
+)
+
+flights_planes %>% 
+  distinct(plane_age) %>% 
+  arrange(plane_age)
+
+(flights_planes <- flights_planes %>% 
+    mutate(plane_age_group = case_when(plane_age >= 0 & plane_age < 10 ~ "0-10",
+                                       plane_age >= 10 & plane_age < 20 ~ "10-20",
+                                       plane_age >= 20 & plane_age < 30 ~ "20-30",
+                                       plane_age >= 30 & plane_age < 40 ~ "30-40",
+                                       plane_age >= 40 & plane_age < 50 ~ "40-50",
+                                       plane_age >= 50 & plane_age <= 60 ~ "50-60",
+                                       plane_age > 60 ~">60",
+                                       TRUE ~ as.character(plane_age)), .after = plane_age
+    )
+)
+
+flights_planes_trim <- flights_planes %>%  
+  select(dep_delay, delayed_dep, carrier, origin, distance_range, dep_hour, dep_month, plane_age_group, manufacturer, engine ) 
+```
+## Rearrange to sensible order
+
+```{r}
+(flights_weather_clean <- flights_weather %>% 
+   select(time_hour, month, hour, minute, flight, sched_dep_time, dep_time, dep_delay, delayed_dep, sched_arr_time, arr_time, arr_delay, delayed_arr, distance_range, air_time, carrier, tailnum, origin, dest, route, temp, temp_range, dewp:visib_range)
+)
+```
+
+## Create flights_weather_ranges
+
+create dataframe of 'grouped' weather data
+
+```{r}
+(flights_weather_ranges <- flights_weather_clean %>% 
+   select(c("dep_delay", "delayed_dep", "delayed_arr", "carrier", "tailnum", "route", "origin", "dest", "distance_range", "temp_range", "humid_range", "wind_dir_range", "wind_speed_range", "wind_gust_range", "precip_range", "visib_range", "pressure_range", "dewp_range", "month", "hour"))
+)
+```
+
+
+--------------------------------------------------------------------------------
+
+# Exploration and Analysis
+
+```{r}
+# explore routes
+flights_clean %>% 
+  group_by(route) %>% 
+  count() %>% 
+  arrange(desc(n))
+```
+
+```{r}
+# explore airlines
+flights_clean %>% 
+  group_by(carrier) %>% 
+  count() %>% 
+  arrange(desc(n))
+```
+
+
+
+```{r}
+# explore uniqueness of flights numbers
+flights_clean %>% 
+  group_by(flight) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+```
+
+# Explore variables:
+
+## How does the % of delayed flights differ with each variable?
+- can't just count total delays for each variable, as some variables will have more flights than others so will experience more delays
+- for example, the temperature at EWK airport probably sits within the same region, so most flights will be recorded within that region, so it will have more          delays total than an extreme temperature that is less frequently recorded.
+- to combat this: 
+- filter data by grouping by that variable
+- then finding total flights with that variable category
+- then find percentage of these flights that were delayed
+- do this across all airports, and at each of the 3 individually
+
+### Temperature
+
+
+```{r}
+# temperature
+
+
+(flights_weather_temp <- flights_weather_ranges %>% 
+   drop_na(temp_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(temp_range) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(temp_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that range
+   select(-total_flights) # remove total flights column
+)
+
+
+# all airports
+flights_weather_temp %>% 
+  drop_na(percent) %>% 
+  drop_na(temp_range) %>% 
+  group_by(temp_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = temp_range, y = percent)) +
+  geom_col() +
+  labs(x = "Temperature (°F)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Temperature (°F)")
+
+# EWR
+flights_weather_temp %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(temp_range) %>% 
+  group_by(temp_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = temp_range, y = percent)) +
+  geom_col() +
+  labs(x = "Temperature (°F)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Temperature at EWR (°F)")
+
+
+# JFK
+flights_weather_temp %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(temp_range) %>% 
+  group_by(temp_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = temp_range, y = percent)) +
+  geom_col() +
+  labs(x = "Temperature (°F)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Temperature at JFK (°F)")
+
+
+# LGA
+flights_weather_temp %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(temp_range) %>% 
+  group_by(temp_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = temp_range, y = percent)) +
+  geom_col() +
+  labs(x = "Temperature (°F)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Temperature at LGA (°F)")
+```
+
+### Precipitation
+
+```{r}
+(flights_weather_precip <- flights_weather_ranges %>% 
+   drop_na(precip_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(precip_range) %>% 
+   mutate(total_flights_precip = n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(precip_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights_precip)* 100)) %>% # get % of flights delayed/not delayed within that precip_range
+   select(-total_flights_precip) # remove total flights column
+)
+
+# All airports
+flights_weather_precip %>% 
+  drop_na(percent) %>% 
+  drop_na(precip_range) %>% 
+  group_by(precip_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(precip_range, levels = c("0.00", "0.00 - 0.05", "0.05 - 0.10", "0.10 - 0.15", "0.15 - 0.20",">0.20")), y = percent)) +
+  geom_col() +
+  labs(x = "Precipitation (inches)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Precipitation Reading at EWR, JFK & LGA")
+
+# EWR
+flights_weather_precip %>%
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(precip_range) %>% 
+  group_by(precip_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(precip_range, levels = c("0.00", "0.00 - 0.05", "0.05 - 0.10", "0.10 - 0.15", "0.15 - 0.20",">0.20")), y = percent)) +
+  geom_col() +
+  labs(x = "Precipitation (inches)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vsr Precipitation Reading at EWR")
+
+# JFK
+flights_weather_precip %>%
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(precip_range) %>% 
+  group_by(precip_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(precip_range, levels = c("0.00", "0.00 - 0.05", "0.05 - 0.10", "0.10 - 0.15", "0.15 - 0.20",">0.20")), y = percent)) +
+  geom_col() +
+  labs(x = "Precipitation (inches)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Precipitation Reading at JFK")
+
+#LGA
+flights_weather_precip %>%
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(precip_range) %>% 
+  group_by(precip_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(precip_range, levels = c("0.00", "0.00 - 0.05", "0.05 - 0.10", "0.10 - 0.15", "0.15 - 0.20",">0.20")), y = percent)) +
+  geom_col() +
+  labs(x = "Precipitation (inches)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Precipitation Reading at LGA")
+```
+
+### Wind Direction
+
+```{r}
+# wind direction
+
+# filter df
+(flights_weather_wind_dir <- flights_weather_ranges %>% 
+   drop_na(wind_dir_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(wind_dir_range) %>% 
+   mutate(total_flights_wind_dir =   n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(wind_dir_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights_wind_dir)* 100)) %>% # get % of flights delayed/not delayed within that precip_range
+   select(-total_flights_wind_dir) # remove total flights column
+)
+
+
+# all airports
+flights_weather_wind_dir %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_dir_range) %>% 
+  group_by(wind_dir_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_dir_range, levels = c("North", "South", "East", "West")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Direction", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per wind Direction (All airports)")
+
+# EWR
+flights_weather_wind_dir %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_dir_range) %>% 
+  group_by(wind_dir_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_dir_range, levels = c("North", "South", "East", "West")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Direction", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per wind Direction (EWR)")
+
+
+# JFK
+flights_weather_wind_dir %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_dir_range) %>% 
+  group_by(wind_dir_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_dir_range, levels = c("North", "South", "East", "West")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Direction", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per wind Direction (JFK)")
+
+
+# LGA
+flights_weather_wind_dir %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_dir_range) %>% 
+  group_by(wind_dir_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_dir_range, levels = c("North", "South", "East", "West")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Direction", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per wind Direction (LGA)")
+
+
+
+```
+
+
+
+
+### Wind Speed
+
+```{r}
+# filter df
+(flights_weather_wind_speed <- flights_weather_ranges %>% 
+   drop_na(wind_speed_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(wind_speed_range) %>% 
+   mutate(total_flights_wind_speed =   n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(wind_speed_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights_wind_speed)* 100)) %>% # get % of flights delayed/not delayed within that range
+   select(-total_flights_wind_speed) # remove total flights column
+)
+
+
+# all airports
+flights_weather_wind_speed %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_speed_range) %>% 
+  group_by(wind_speed_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_speed_range, levels = c("0 - 10", "10 - 20", "20 - 30", "30 - 40")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Speed (mph)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per wind Speed (mph) in All Airports")
+
+# EWR
+flights_weather_wind_speed %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_speed_range) %>% 
+  group_by(wind_speed_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_speed_range, levels = c("0 - 10", "10 - 20", "20 - 30", "30 - 40")), y = percent, fill = wind_speed_range)) +
+  geom_col() +
+  labs(x = "", 
+       y = "", 
+       title = "") +
+  scale_fill_manual(values = c("0 - 10" = "#67bc7d","10 - 20" = "#8dcd9e","20 - 30" = "#54b36d")) +
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "transparent", fill=NA, size=5),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_cartesian(expand = FALSE)
+
+ggsave("windspeed_flightdelay.png", width = 10, height = 5)
+
+
+
+# JFK
+flights_weather_wind_speed %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_speed_range) %>% 
+  group_by(wind_speed_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_speed_range, levels = c("0 - 10", "10 - 20", "20 - 30", "30 - 40")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Speed (mph)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per wind Speed (mph) at JFK")
+
+# LGA
+flights_weather_wind_speed %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_speed_range) %>% 
+  group_by(wind_speed_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_speed_range, levels = c("0 - 10", "10 - 20", "20 - 30", "30 - 40")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Speed (mph)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per wind Speed (mph) at LGA")
+
+
+```
+
+### Gust Speed
+```{r}
+# gust speed
+
+# filter DF
+(flights_weather_gust_speed <- flights_weather_ranges %>% 
+   drop_na(wind_gust_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(wind_gust_range) %>% 
+   mutate(total_flights_wind_gust =   n()) %>% # get total flights within each gust_range
+   ungroup() %>% 
+   group_by(wind_gust_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights_wind_gust)* 100)) %>% # get % of flights delayed/not delayed within that range
+   select(-wind_gust_range) # remove total flights column
+)
+
+
+# All airports
+flights_weather_wind_speed %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_gust_range) %>% 
+  group_by(wind_gust_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_gust_range, levels = c("0 - 10", "10 - 20", "20 - 30", "30 - 40", ">40")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Gust (mph)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Wind Gust (mph)")
+
+# EWR
+flights_weather_wind_speed %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_gust_range) %>% 
+  group_by(wind_gust_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_gust_range, levels = c("0 - 10", "10 - 20", "20 - 30", "30 - 40", ">40")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Gust (mph)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Wind Gust at EWR (mph)")
+
+# JFK
+flights_weather_wind_speed %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_gust_range) %>% 
+  group_by(wind_gust_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_gust_range, levels = c("0 - 10", "10 - 20", "20 - 30", "30 - 40", ">40")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Gust (mph)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Wind Gust at JFK (mph)")
+
+# LGA
+flights_weather_wind_speed %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(wind_gust_range) %>% 
+  group_by(wind_gust_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(wind_gust_range, levels = c("0 - 10", "10 - 20", "20 - 30", "30 - 40", ">40")), y = percent)) +
+  geom_col() +
+  labs(x = "Wind Gust (mph)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Wind Gust at LGA (mph)")
+
+```
+
+
+###  Visibility 
+```{r}
+# visibility
+(flights_weather_visib <- flights_weather_ranges %>% 
+   drop_na(visib_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(visib_range) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each vis_range
+   ungroup() %>% 
+   group_by(visib_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that precip_range
+   select(-total_flights) # remove total flights column
+)
+
+
+
+flights_weather_visib %>% 
+  drop_na(percent) %>% 
+  drop_na(visib_range) %>% 
+  group_by(visib_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = visib_range, y = percent)) +
+  geom_col() +
+  labs(x = "Visibility (miles)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Visibility (miles)")
+
+
+flights_weather_visib %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(visib_range) %>% 
+  group_by(visib_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = visib_range, y = percent)) +
+  geom_col() +
+  labs(x = "Visibility (miles)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Visibility (miles) at EWR")
+
+
+flights_weather_visib %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(visib_range) %>% 
+  group_by(visib_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = visib_range, y = percent)) +
+  geom_col() +
+  labs(x = "Visibility (miles)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Visibility (miles) at JFK")
+
+
+flights_weather_visib %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(visib_range) %>% 
+  group_by(visib_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = visib_range, y = percent)) +
+  geom_col() +
+  labs(x = "Visibility (miles)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Visibility (miles) at LGA")
+
+```
+
+### Humidity
+```{r}
+(flights_weather_humid <- flights_weather_ranges %>% 
+   drop_na(humid_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(humid_range) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(humid_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that range
+   select(-total_flights) # remove total flights column
+)
+
+# all airports
+flights_weather_humid %>% 
+  drop_na(percent) %>% 
+  drop_na(humid_range) %>% 
+  group_by(humid_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = humid_range, y = percent)) +
+  geom_col() +
+  labs(x = "Humidity", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Humidity (%)")
+
+# EWR
+humid_labels <- c("10 - 20", "20 - 30", "30 - 40","40 - 50","50 - 60","60 - 70","70 - 80","80 - 90","90 - 100")
+blue_palette <- colorRampPalette(c("#7aaad3", "#649ccb", "#4d8dc4", "#377fbc", "#2171b5", "#1e66a3", "#1a5a91", "#174f7f", "#14446d"))
+green_palette <- colorRampPalette(c("#8dcd9e", "#67bc7d", "#54b36d", "#41AB5D", "#3b9a54", "#34894a", "#34894a", "#2e7841"))                               
+flights_weather_humid %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(humid_range) %>%
+  mutate(humid_range_num = case_when(humid_range == "10 - 20" ~"10", # convert humid ranges back to nums to use colour scale
+                                     humid_range == "20 - 30"~"20",
+                                     humid_range == "30 - 40"~"30",
+                                     humid_range == "40 - 50"~"40",
+                                     humid_range == "50 - 60"~"50",
+                                     humid_range == "60 - 70"~"60",
+                                     humid_range == "70 - 80"~"70",
+                                     humid_range == "80 - 90"~"80",
+                                     humid_range == "90 - 100"~"90",
+                                     humid_range == ">100"~"100",
+                                     TRUE ~ as.character(humid_range)),
+         humid_range_num = as.numeric(humid_range_num)) %>% 
+  group_by(humid_range_num, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = humid_range_num, y = percent, fill = humid_range_num)) +
+  geom_col(colour = "seashell") +
+  labs(x = "", 
+       y = "", 
+       title = "") +
+  scale_fill_gradientn(colors = green_palette(length(humid_labels)))+
+  scale_x_continuous(breaks = seq(10, 90, 10), labels = humid_labels) +
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "transparent", fill=NA, size=5),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_cartesian(expand = FALSE)
+ggsave("humidity_flightdelay.png", width = 10, height = 5)
+
+
+
+# JFK (broken)
+# flights_weather_humid %>% 
+#   filter(origin == "JFK") %>% 
+#   drop_na(percent) %>% 
+#   drop_na(humid_range) %>% 
+#   group_by(humid_range, delayed_dep) %>%
+#   distinct(percent) %>% 
+#   filter(delayed_dep == TRUE) %>% 
+#   ggplot(aes(x = humid_range, y = percent)) +
+#   geom_col(colour = humid_range) +
+#   labs(x = "Humidity", 
+#        y = "Percentage of Flights Delayed", 
+#        title = "Percentage of Flights Delayed vs Humidity at JFK (%)") 
+# LGA
+flights_weather_humid %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(humid_range) %>% 
+  group_by(humid_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = humid_range, y = percent)) +
+  geom_col() +
+  labs(x = "Humidity", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Humidity at LGA (%)") 
+
+```
+```{r}
+brewer.pal(9, "Greens")
+```
+
+
+### Pressure
+```{r}
+# pressure
+
+(flights_weather_pressure <- flights_weather_ranges %>% 
+   drop_na(pressure_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(pressure_range) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(pressure_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that range
+   select(-total_flights) # remove total flights column
+)
+
+# all airports
+flights_weather_pressure %>% 
+  drop_na(percent) %>% 
+  drop_na(pressure_range) %>% 
+  group_by(pressure_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(pressure_range, levels = c("< 910", "910 - 930", "930 - 950",
+                                                   "950 - 970", "970 - 990", "990 - 1010",
+                                                   "1010 - 1030", "1030 - 1050", ">1050")),
+             y = percent)) +
+  geom_col() +
+  labs(x = "Pressure (mB)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Pressure (mB)")
+
+# EWR
+flights_weather_pressure %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(pressure_range) %>% 
+  group_by(pressure_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(pressure_range, levels = c("< 910", "910 - 930", "930 - 950",
+                                                   "950 - 970", "970 - 990", "990 - 1010",
+                                                   "1010 - 1030", "1030 - 1050", ">1050")),
+             y = percent)) +
+  geom_col() +
+  labs(x = "Pressure (mB)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Pressure at EWR (mB)")
+
+# JFK
+flights_weather_pressure %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(pressure_range) %>% 
+  group_by(pressure_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(pressure_range, levels = c("< 910", "910 - 930", "930 - 950",
+                                                   "950 - 970", "970 - 990", "990 - 1010",
+                                                   "1010 - 1030", "1030 - 1050", ">1050")),
+             y = percent)) +
+  geom_col() +
+  labs(x = "Pressure (mB)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Pressure at JFK (mB)")
+# LGA
+flights_weather_pressure %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(pressure_range) %>% 
+  group_by(pressure_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(pressure_range, levels = c("< 910", "910 - 930", "930 - 950",
+                                                   "950 - 970", "970 - 990", "990 - 1010",
+                                                   "1010 - 1030", "1030 - 1050", ">1050")),
+             y = percent)) +
+  geom_col() +
+  labs(x = "Pressure (mB)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Pressure at LGA (mB)")
+```
+### Dewpoint
+```{r}
+(flights_weather_dewp <- flights_weather_ranges %>% 
+   drop_na(dewp_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(dewp_range) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(dewp_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that precip_range
+   select(-total_flights) # remove total flights column
+)
+# all airports
+flights_weather_dewp %>% 
+  drop_na(percent) %>% 
+  drop_na(dewp_range) %>% 
+  group_by(dewp_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = dewp_range, y = percent)) +
+  geom_col() +
+  labs(x = "Dewpoint (°F)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Dewpoint (°F)")
+
+# EWR
+
+dewp_labels <- c("10 - 20", "20 - 30", "30 - 40","40 - 50","50 - 60","60 - 70","70 - 80")
+green_palette <- colorRampPalette(c("#8dcd9e", "#67bc7d", "#54b36d", "#41AB5D", "#3b9a54", "#34894a", "#34894a", "#2e7841")) 
+
+flights_weather_dewp %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(dewp_range) %>% 
+  mutate(dewp_range_num = case_when(dewp_range == "10 - 20" ~"10", # convert dewp ranges back to nums to use colour scale
+                                    dewp_range == "20 - 30"~"20",
+                                    dewp_range == "30 - 40"~"30",
+                                    dewp_range == "40 - 50"~"40",
+                                    dewp_range == "50 - 60"~"50",
+                                    dewp_range == "60 - 70"~"60",
+                                    dewp_range == "70 - 80"~"70",
+                                    TRUE ~ as.character(dewp_range)),
+         dewp_range_num = as.numeric(dewp_range_num)) %>% 
+  group_by(dewp_range_num, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = dewp_range_num, y = percent, fill = dewp_range_num)) +
+  geom_col() +
+  labs(x = "", 
+       y = "", 
+       title = "") +
+  scale_fill_gradientn(colors = green_palette(length(dewp_labels))) +
+  scale_x_continuous(breaks = seq(10, 70, 10), labels = dewp_labels) +
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "transparent", fill=NA, size=5),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_cartesian(expand = FALSE)
+
+ggsave("dewp_flightdelay.png", width = 10, height = 5)
+
+
+
+# JFK
+flights_weather_dewp %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(dewp_range) %>% 
+  group_by(dewp_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = dewp_range, y = percent)) +
+  geom_col() +
+  labs(x = "Dewpoint (°F)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Dewpoint at JFK (°F)")
+
+# LGA
+flights_weather_dewp %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(dewp_range) %>% 
+  group_by(dewp_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = dewp_range, y = percent)) +
+  geom_col() +
+  labs(x = "Dewpoint (°F)", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed vs Dewpoint at LGA (°F)")
+```
+
+### Month
+```{r}
+
+(flights_weather_month <- flights_weather_ranges %>% 
+   
+   drop_na(delayed_dep) %>% 
+   group_by(month) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each month
+   ungroup() %>% 
+   group_by(month, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that month
+   select(-total_flights) # remove total flights column
+)
+
+
+# all airports
+flights_weather_month %>% 
+  drop_na(percent) %>% 
+  drop_na(month) %>% 
+  group_by(month, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(month, level = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y = percent)) +
+  geom_col() +
+  labs(x = "month", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Month")
+
+# EWR
+
+months <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep")#, "Oct", "Nov", "Dec")
+green_palette <- colorRampPalette(c("#8dcd9e", "#67bc7d", "#54b36d", "#41AB5D", "#3b9a54", "#34894a", "#34894a", "#2e7841")) 
+flights_weather_month %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(month) %>% 
+  group_by(month, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(month, level = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y = percent, fill = month)) +
+  geom_col() +
+  labs(x = "", 
+       y = "", 
+       title = "") +
+  scale_fill_gradientn(colors = green_palette(length(months))) +
+  scale_x_discrete(breaks = seq(1, 9, 1), labels = months) +
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "transparent", fill=NA, size=5),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_cartesian(expand = FALSE)
+
+ggsave("month_flightdelay.png", width = 10, height = 5)
+
+
+# JFK
+flights_weather_month %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(month) %>% 
+  group_by(month, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(month, level = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y = percent)) +
+  geom_col() +
+  labs(x = "month", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Month at JFK")
+
+# LGA
+flights_weather_month %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(month) %>% 
+  group_by(month, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(month, level = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y = percent)) +
+  geom_col() +
+  labs(x = "month", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Month at LGA")
+
+```
+###  Hour
+```{r}
+# hour
+
+(flights_weather_hour <- flights_weather_ranges %>% 
+   drop_na(hour) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(hour) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each hour
+   ungroup() %>% 
+   group_by(hour, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that hour
+   select(-total_flights) # remove total flights column
+)
+
+
+# all airports
+flights_weather_hour %>% 
+  drop_na(percent) %>% 
+  drop_na(hour) %>% 
+  group_by(hour, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(hour, levels = c(1:24, 0)), y = percent)) +
+  geom_col() +
+  labs(x = "Hour", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Hour")
+
+
+# EWR
+flights_weather_hour %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(hour) %>% 
+  group_by(hour, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(hour, levels = c(1:24, 0)), y = percent)) +
+  geom_col() +
+  labs(x = "Hour", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Hour at EWR")
+
+
+# JFK
+flights_weather_hour %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(hour) %>% 
+  group_by(hour, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(hour, levels = c(1:24, 0)), y = percent)) +
+  geom_col() +
+  labs(x = "Hour", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Hour at JFK")
+
+
+# LGA
+flights_weather_hour %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(hour) %>% 
+  group_by(hour, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(hour, levels = c(1:24, 0)), y = percent)) +
+  geom_col() +
+  labs(x = "Hour", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Hour at LGA")
+```
+### Distance
+
+```{r}
+# distance 
+(flights_distance <- flights_weather_clean %>% 
+   drop_na(distance_range) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(distance_range) %>% 
+   mutate(total_flights =   n()) %>% 
+   ungroup() %>% 
+   group_by(distance_range, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% 
+   select(-total_flights) 
+)
+
+
+# all airports
+flights_distance %>% 
+  drop_na(percent) %>% 
+  drop_na(distance_range) %>% 
+  group_by(distance_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = distance_range, y = percent)) +
+  geom_col() +
+  labs(x = "Distance", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed by Flight Distance")
+
+
+# EWR
+
+flights_distance %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(distance_range) %>% 
+  group_by(distance_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = distance_range, y = percent)) +
+  geom_col() +
+  labs(x = "Distance", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed by Flight Distance at EWR")
+
+
+# JFK
+flights_distance %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(distance_range) %>% 
+  group_by(distance_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = distance_range, y = percent)) +
+  geom_col() +
+  labs(x = "Distance", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed by Flight Distance at JFK")
+
+
+# LGA
+flights_distance %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(distance_range) %>% 
+  group_by(distance_range, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = distance_range, y = percent)) +
+  geom_col() +
+  labs(x = "Distance", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage")
+
+
+```
+
+### Origin Airport
+```{r}
+# origin airport
+
+(flights_weather_origin <- flights_weather_ranges %>% 
+   drop_na(origin) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(origin) %>% 
+   mutate(total_flights =   n()) %>% # 
+   ungroup() %>% 
+   group_by(origin, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% 
+   select(-total_flights) 
+)
+
+flights_weather_origin %>% 
+  drop_na(percent) %>% 
+  drop_na(origin) %>% 
+  group_by(origin, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = origin, y = percent)) +
+  geom_col() +
+  labs(x = "Origin Airport", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Origin Airport")
+
+
+
+```
+### Carrier
+
+
+
+```{r}
+# carrier
+
+(flights_weather_carrier <- flights_weather_ranges %>% 
+   drop_na(carrier) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(origin,carrier) %>% 
+   mutate(total_flights =   n()) %>% 
+   ungroup() %>% 
+   group_by(origin, carrier, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% 
+   select(-total_flights) 
+)
+# all airports
+flights_weather_carrier %>% 
+  drop_na(percent) %>% 
+  drop_na(carrier) %>% 
+  group_by(origin,carrier, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = carrier, y = percent)) +
+  facet_wrap(~origin) +
+  geom_col() +
+  labs(x = "Airline", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Airline")
+
+# EWR
+flights_weather_origin %>% 
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(carrier) %>% 
+  group_by(carrier, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = carrier, y = percent)) +
+  geom_col() +
+  labs(x = "Airline", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Airline")
+
+# JFK
+flights_weather_origin %>% 
+  filter(origin == "JFK") %>% 
+  drop_na(percent) %>% 
+  drop_na(carrier) %>% 
+  group_by(carrier, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = carrier, y = percent)) +
+  geom_col() +
+  labs(x = "Airline", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Airline")
+
+# LGA
+flights_weather_origin %>% 
+  filter(origin == "LGA") %>% 
+  drop_na(percent) %>% 
+  drop_na(carrier) %>% 
+  group_by(carrier, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = carrier, y = percent)) +
+  geom_col() +
+  labs(x = "Airline", 
+       y = "Percentage of Flights Delayed", 
+       title = "Percentage of Flights Delayed per Airline")
+```
+
+
+```{r}
+#("#8dcd9e", "#67bc7d", "#54b36d", "#41AB5D", "#3b9a54", "#34894a", "#34894a", "#2e7841"
+flights_weather_carrier %>% 
+  filter(carrier %in% c("AA", "B6", "DL", "VX")) %>% 
+  drop_na(percent) %>% 
+  group_by(origin,carrier, delayed_dep) %>% 
+  mutate(carrier = case_when(carrier == "AA" ~ "American Airlines",
+                             carrier == "B6" ~ "JetBlue Airways",
+                             carrier == "DL" ~ "Delta",
+                             carrier == "VX" ~ "Virgin America"),
+         origin = case_when(origin == "EWR" ~ "Newark Airport",
+                            origin == "JFK" ~ "John. F Kennedy Airport",
+                            origin == "LGA" ~ "La Guardia Airport")) %>% 
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = factor(carrier, levels = c("JetBlue Airways", "Delta", "Virgin America", "American Airlines")), y = percent, fill = carrier)) +
+  geom_col () +
+  facet_wrap(~origin) +
+  scale_fill_manual(values = c("JetBlue Airways" = "#67bc7d","Virgin America" = "#8dcd9e","Delta" = "#54b36d",  "American Airlines" = "#3b9a54")) +
+  labs(x = "", 
+       y = "", 
+       title = "") +
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "darkgreen", linetype = 1),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "darkgreen", fill=NA, size=1),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_flip(expand = FALSE) 
+
+ggsave("airline_performance.png", width = 10, height = 5)
+```
+
+### Plane age
+
+```{r}
+(flights_planes_age <- flights_planes %>% 
+   drop_na(plane_age_group) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(plane_age_group) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(plane_age_group, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that precip_range
+   select(-total_flights) # remove total flights column
+)
+# ewr
+flights_planes_age %>%
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(plane_age_group) %>% 
+  group_by(plane_age_group, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = plane_age_group, y = percent, fill = plane_age_group)) +
+  geom_col() +
+  labs(x = "", 
+       y = "", 
+       title = "") +
+  #("#8dcd9e", "#67bc7d", "#54b36d", "#41AB5D", "#3b9a54", "#34894a", "#34894a", "#2e7841"
+  scale_fill_manual(values = c("0-10" = "#8dcd9e","10-20" = "#67bc7d","20-30" = "#54b36d",  "30-40" = "#41AB5D", "40-50" = "#3b9a54", "50-60" = "#34894a")) +
+  
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "transparent", fill=NA, size=5),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_cartesian(expand = FALSE)
+ggsave("plane_age_delay.png", width = 10, height = 5)
+
+```
+### Plane Manufacturer
+
+
+```{r}
+(flights_planes_man <- flights_planes %>% 
+   drop_na(manufacturer) %>% 
+   drop_na(delayed_dep) %>% 
+   group_by(manufacturer) %>% 
+   mutate(total_flights =   n()) %>% # get total flights within each range
+   ungroup() %>% 
+   group_by(manufacturer, delayed_dep) %>% 
+   mutate(percent = round((n()/total_flights)* 100)) %>% # get % of flights delayed/not delayed within that precip_range
+   select(-total_flights) # remove total flights column
+)
+# ewr
+flights_planes_man %>%
+  filter(origin == "EWR") %>% 
+  drop_na(percent) %>% 
+  drop_na(manufacturer) %>% 
+  group_by(manufacturer, delayed_dep) %>%
+  distinct(percent) %>% 
+  filter(delayed_dep == TRUE) %>% 
+  ggplot(aes(x = manufacturer, y = percent, fill = manufacturer)) +
+  geom_col() +
+  labs(x = "", 
+       y = "", 
+       title = "") +
+  #("#8dcd9e", "#67bc7d", "#54b36d", "#41AB5D", "#3b9a54", "#34894a", "#34894a", "#2e7841"
+  scale_fill_manual(values = c("0-10" = "#8dcd9e","10-20" = "#67bc7d","20-30" = "#54b36d",  "30-40" = "#41AB5D", "40-50" = "#3b9a54", "50-60" = "#34894a")) +
+  
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "transparent", fill=NA, size=5),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_flip(expand = FALSE)
+ggsave("plane_age_delay.png", width = 10, height = 5)
+
+
+planes %>% 
+  distinct(manufacturer)
+```
+
+
+It looks like weather conditions do have an impact on flight delays, but these don't vary much between airports.
+
+## How does the length of the delay vary across the variables?
+
+### Temperature
+
+```{r}
+
+flights_weather_ranges %>% 
+  group_by(temp_range) %>% 
+  drop_na(temp_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = temp_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(temp_range) %>% 
+  drop_na(temp_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = temp_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(temp_range) %>% 
+  drop_na(temp_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = temp_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(temp_range) %>% 
+  drop_na(temp_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = temp_range, y = mean(dep_delay))) +
+  geom_col()
+```
+
+### Precipitation
+
+```{r}
+# precipitation
+
+flights_weather_ranges %>% 
+  group_by(precip_range) %>% 
+  drop_na(precip_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = precip_range, y = mean(dep_delay))) +
+  geom_col()
+
+# ewr
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(precip_range) %>% 
+  drop_na(precip_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = precip_range, y = mean(dep_delay))) +
+  geom_col()
+
+# jfk
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(precip_range) %>% 
+  drop_na(precip_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = precip_range, y = mean(dep_delay))) +
+  geom_col()
+
+# lga
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(precip_range) %>% 
+  drop_na(precip_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = precip_range, y = mean(dep_delay))) +
+  geom_col()
+```
+### Wind Direction
+
+```{r}
+# wind direction
+
+flights_weather_ranges %>% 
+  group_by(wind_dir_range) %>% 
+  drop_na(wind_dir_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_dir_range, y = mean(dep_delay))) +
+  geom_col() 
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(wind_dir_range) %>% 
+  drop_na(wind_dir_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_dir_range, y = mean(dep_delay))) +
+  geom_col() 
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(wind_dir_range) %>% 
+  drop_na(wind_dir_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_dir_range, y = mean(dep_delay))) +
+  geom_col() 
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(wind_dir_range) %>% 
+  drop_na(wind_dir_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_dir_range, y = mean(dep_delay))) +
+  geom_col() 
+
+```
+### Wind Speed
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(wind_speed_range) %>% 
+  drop_na(wind_speed_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_speed_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(wind_speed_range) %>% 
+  drop_na(wind_speed_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_speed_range, y = mean(dep_delay), fill = wind_speed_range)) +
+  geom_col() +
+labs(x = "", 
+       y = "", 
+       title = "") +
+  scale_fill_manual(values = c("0 - 10" = "#67bc7d","10 - 20" = "#8dcd9e","20 - 30" = "#54b36d")) +
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "transparent", fill=NA, size=5),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_cartesian(expand = FALSE)
+
+ggsave("windspeed_flightdelay.png", width = 10, height = 5)
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(wind_speed_range) %>% 
+  drop_na(wind_speed_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_speed_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(wind_speed_range) %>% 
+  drop_na(wind_speed_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_speed_range, y = mean(dep_delay))) +
+  geom_col()
+```
+### Gust Speed
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(wind_gust_range) %>% 
+  drop_na(wind_gust_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_gust_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(wind_gust_range) %>% 
+  drop_na(wind_gust_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_gust_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(wind_gust_range) %>% 
+  drop_na(wind_gust_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_gust_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(wind_gust_range) %>% 
+  drop_na(wind_gust_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = wind_gust_range, y = mean(dep_delay))) +
+  geom_col()
+```
+
+### Visibility
+
+```{r}
+
+flights_weather_ranges %>% 
+  group_by(visib_range) %>% 
+  drop_na(visib_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = visib_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(visib_range) %>% 
+  drop_na(visib_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = visib_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(visib_range) %>% 
+  drop_na(visib_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = visib_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(visib_range) %>% 
+  drop_na(visib_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = visib_range, y = mean(dep_delay))) +
+  geom_col()
+```
+### Humidity
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(humid_range) %>% 
+  drop_na(humid_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = humid_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>%
+  filter(origin == "EWR") %>% 
+  group_by(humid_range) %>% 
+  drop_na(humid_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = humid_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>%
+  filter(origin == "JFK") %>% 
+  group_by(humid_range) %>% 
+  drop_na(humid_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = humid_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>%
+  filter(origin == "LGA") %>% 
+  group_by(humid_range) %>% 
+  drop_na(humid_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = humid_range, y = mean(dep_delay))) +
+  geom_col()
+```
+### Pressure
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(pressure_range) %>% 
+  drop_na(pressure_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = pressure_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(pressure_range) %>% 
+  drop_na(pressure_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = pressure_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(pressure_range) %>% 
+  drop_na(pressure_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = pressure_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(pressure_range) %>% 
+  drop_na(pressure_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = pressure_range, y = mean(dep_delay))) +
+  geom_col()
+```
+### Dewpoint
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(dewp_range) %>% 
+  drop_na(dewp_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = dewp_range, y = mean(dep_delay))) +
+  geom_col()
+
+dewp_labels <- c("10 - 20", "20 - 30", "30 - 40","40 - 50","50 - 60","60 - 70","70 - 80")
+green_palette <- colorRampPalette(c("#8dcd9e", "#67bc7d", "#54b36d", "#41AB5D", "#3b9a54", "#34894a", "#34894a", "#2e7841")) 
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(dewp_range) %>% 
+  drop_na(dewp_range) %>% 
+  drop_na(dep_delay) %>% 
+  mutate(dewp_range_num = case_when(dewp_range == "10 - 20" ~"10", # convert dewp ranges back to nums to use colour scale
+                                    dewp_range == "20 - 30"~"20",
+                                    dewp_range == "30 - 40"~"30",
+                                    dewp_range == "40 - 50"~"40",
+                                    dewp_range == "50 - 60"~"50",
+                                    dewp_range == "60 - 70"~"60",
+                                    dewp_range == "70 - 80"~"70",
+                                    TRUE ~ as.character(dewp_range)),
+         dewp_range_num = as.numeric(dewp_range_num)) %>% 
+  group_by(dewp_range_num) %>%
+  ggplot(aes(x = dewp_range_num, y = mean(dep_delay), fill = dewp_range_num)) +
+  geom_col() +
+  labs(x = "", 
+       y = "", 
+       title = "") +
+  scale_fill_gradientn(colors = green_palette(length(dewp_labels))) +
+  scale_x_continuous(breaks = seq(10, 70, 10), labels = dewp_labels) +
+  theme(panel.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        plot.background = element_rect(fill = "transparent", colour = "transparent", linetype = "blank"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.line = element_line(linewidth = 2, colour = "white"),
+        panel.border = element_rect(colour = "transparent", fill=NA, size=5),
+        axis.text = element_text(size = 12)
+  ) +
+  coord_cartesian(expand = FALSE)
+
+ggsave("dewp_2.png", width = 10, height = 5, dpi = 1000)
+
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(dewp_range) %>% 
+  drop_na(dewp_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = dewp_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(dewp_range) %>% 
+  drop_na(dewp_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = dewp_range, y = mean(dep_delay))) +
+  geom_col()
+```
+
+```{r}
+flights_weather %>% 
+  ggplot(aes(x = dewp, y = dep_delay)) +
+  geom_point()
+```
+
+
+
+### Month
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(month) %>% 
+  drop_na(month) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = factor(month, level = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(month) %>% 
+  drop_na(month) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = factor(month, level = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y = mean(dep_delay))) +
+  geom_col()
+
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(month) %>% 
+  drop_na(month) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = factor(month, level = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y = mean(dep_delay))) +
+  geom_col()
+
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(month) %>% 
+  drop_na(month) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = factor(month, level = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12")), y = mean(dep_delay))) +
+  geom_col()
+```
+
+### Hour
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(hour) %>% 
+  drop_na(hour) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = hour, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(hour) %>% 
+  drop_na(hour) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = hour, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(hour) %>% 
+  drop_na(hour) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = hour, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(hour) %>% 
+  drop_na(hour) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = hour, y = mean(dep_delay))) +
+  geom_col()
+```
+### Distance
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(distance_range) %>% 
+  drop_na(distance_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = distance_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  group_by(distance_range) %>% 
+  drop_na(distance_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = distance_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  group_by(distance_range) %>% 
+  drop_na(distance_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = distance_range, y = mean(dep_delay))) +
+  geom_col()
+
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  group_by(distance_range) %>% 
+  drop_na(distance_range) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = distance_range, y = mean(dep_delay))) +
+  geom_col()
+
+```
+
+
+### Origin Airport
+
+```{r}
+flights_weather_ranges %>% 
+  group_by(origin) %>% 
+  drop_na(origin) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = origin, y = mean(dep_delay))) +
+  geom_col()
+```
+
+### Carrier
+
+```{r}
+
+flights_weather_ranges %>% 
+  group_by(carrier) %>% 
+  drop_na(carrier) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = carrier, y = mean(dep_delay))) +
+  geom_col()
+#ewr
+flights_weather_ranges %>% 
+  filter(origin == "EWR") %>% 
+  filter(carrier %in% c("AA", "B6", "DL", "VX")) %>% 
+  group_by(carrier) %>% 
+  drop_na(carrier) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = carrier, y = mean(dep_delay))) +
+  geom_col()
+#jfk
+flights_weather_ranges %>% 
+  filter(origin == "JFK") %>% 
+  filter(carrier %in% c("AA", "B6", "DL", "VX")) %>%
+  group_by(carrier) %>% 
+  drop_na(carrier) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = carrier, y = mean(dep_delay))) +
+  geom_col()
+# lga
+flights_weather_ranges %>% 
+  filter(origin == "LGA") %>% 
+  filter(carrier %in% c("AA", "B6", "DL", "VX")) %>%
+  group_by(carrier) %>% 
+  drop_na(carrier) %>% 
+  drop_na(dep_delay) %>% 
+  ggplot(aes(x = carrier, y = mean(dep_delay))) +
+  geom_col()
+```
+
+
+--------------------------------------------------------------------------------
+
+# Business Questions
+
+# 1. What weather causes disruption?
+
+- logical regression model of delayed_dep logical column against all weather variables (random forest)
+- use biggest indicators to pick plots
+
+## Logical Regression Model Building
+
+(for EWR only)
+
+```{r}
+flights_weather_model_data <- flights_weather_ranges %>% 
+  select(delayed_dep, origin, temp_range:dewp_range)
+
+summary(flights_weather_model_data)
+```
+
+```{r}
+weather_delay_model <- flights_weather_model_data %>% 
+  filter(origin == "EWR") %>% 
+  select(-origin, - wind_gust_range) %>% # wind gust will be correlated with wind speed
+  mutate(across(where(is.character), ~as.factor(.x)))
+
+glimpse(weather_delay_model)
+```
+```{r}
+n_data_weather_delay <- nrow(weather_delay_model)
+
+weather_test_index <- sample(1:n_data_weather_delay, size = n_data_weather_delay*0.2)
+
+weather_test <- slice(weather_delay_model, weather_test_index)
+
+weather_train <- slice(weather_delay_model, -weather_test_index)
+```
+
+```{r}
+weather_test %>%  janitor::tabyl(delayed_dep)
+
+weather_train %>% janitor::tabyl(delayed_dep)
+```
+```{r}
+rf_weather_classifier <- ranger(delayed_dep ~ .,
+                                data = weather_train,
+                                importance = "impurity",
+                                num.trees = 1000,
+                                min.node.size = 5)
+
+rf_weather_classifier
+```
+
+```{r}
+sort(importance(rf_weather_classifier), decreasing = TRUE)
+```
+
+humidity > dewpoint > wind speed  > temperature > wind_dir >  precip > visib > pressure
+
+
+
+```{r}
+rf_weather_classifier_pred <- weather_test %>% 
+  drop_na(delayed_dep) %>% 
+  mutate(pred = as.logical(predict(rf_weather_classifier, data = weather_test)$predictions),
+         pred = as.factor(pred),
+         delayed_dep = as.factor(delayed_dep))
+
+
+```
+
+```{r}
+(cf <- confusionMatrix(rf_weather_classifier_pred$pred, rf_weather_classifier_pred$delayed_dep))
+
+print(cf)
+```
+
+```{r}
+weather_cf_tibble <- tibble(delay = c("Delayed","Delayed","Not Delayed", "Not Delayed"),
+                            predicted = c("Correct", "Incorrect", "Correct", "Incorrect"),
+                            count = c("93", "90", "241", "48"))
+
+weather_cf_tibble %>% 
+  
+  ggplot(aes(x = delay, y = count, fill = predicted)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Correct" = "darkturquoise", "Incorrect" = "darkgreen")) +
+  labs(x = "",
+       y = "Count",
+       title = "Model Prediction Performance")
+
+ggsave("weather_model.png", height = 5, width = 7)
+```
+
+```{r}
+rf_weather_classifier_pred 
+```
+
+
+
+
+
+```{r}
+summary(rf_weather_classifier)
+```
+
+
+
+```{r}
+roc_obj <- rf_weather_classifier_pred %>% 
+  mutate(pred = if_else(pred == TRUE, 1, 0)) %>% 
+  roc(response = delayed_dep, predictor = pred)
+
+roc_curve <- ggroc(data = roc_obj, legacy.axes = TRUE) +
+  coord_fixed() +
+  ylab("Sensitivity (TPR)") +
+  xlab("1-specificity (TNR)")
+
+roc_curve
+
+
+```
+```{r}
+auc(roc_obj)
+```
+```{r}
+gini = 2 * 0.6711 - 1
+
+gini
+```
+
+
+
+# 2. How serious are weather related delays
+
+- linear regression of length of delay vs weather factors
+- use biggest indicators to pick plots
+
+# Linear regression model of delay time vs weather
+
+check what correlations look like
+
+```{r}
+flights_weather
+```
+
+```{r}
+flights_weather %>% 
+  select(dep_delay, dewp, wind_speed, precip)
+```
+
+select columns
+
+```{r}
+# length of delay and all weather columns
+flights_weather_lr <- flights_weather %>% 
+  select(dep_delay, temp, dewp, humid, wind_dir, wind_speed, wind_gust, precip, pressure, visib)
+```
+
+```{r}
+alias(lm(dep_delay ~., data = flights_weather_lr))
+```
+wind_gust and wind_speed can be calculated from each other, since wind_gust is a measurement of wind_speed drop wind_gust
+
+```{r}
+flights_weather_lr_trim <- flights_weather_lr %>% 
+  select(-wind_gust)
+```
+
+```{r message=FALSE, warning=FALSE}
+ggpairs(flights_weather_lr_trim)
+```
+
+Would expect similar correlations as seen in the logical delayed model, which we do see.
+Dewpoint and humidity have the highest correlation, followed by temp, wind_speed, precipitation.
+
+There is a really high correlation between dewpoint and temperature and humidity which you would expect.
+
+first predictor
+
+```{r}
+mod1a <- lm(dep_delay ~ dewp, data = flights_weather_lr_trim)
+mod1b <- lm(dep_delay ~ humid, data = flights_weather_lr_trim)
+
+autoplot(mod1a)
+autoplot(mod1b)
+
+summary(mod1a)
+summary(mod1b)
+```
+both stat sig (p values very low)
+mod1a has better r squared
+mod1a has slightly lower rse
+
+choose mod1a
+delayed_dep = intercept + dewpoint
+delayed_dep = -6.130 + 0.38*dewpoint
+
+second predictor
+
+add residuals
+
+```{r}
+flights_weather_lr_resids <- flights_weather_lr_trim %>% 
+  add_residuals(mod1a) %>% 
+  select(-c(dep_delay, dewp))
+```
+
+examine remining associations
+
+```{r message=FALSE, warning=FALSE}
+flights_weather_lr_resids %>% 
+  ggpairs()
+```
+wind_speed has the strongest correlation with the residuals, precipitation is next highest after that.
+Check these 2 variables performance wth the model:
+
+```{r}
+
+mod2a <- lm(dep_delay ~ dewp + wind_speed, data = flights_weather_lr_trim)
+mod2b <- lm(dep_delay ~ dewp + precip, data = flights_weather_lr_trim)
+
+autoplot(mod2a)
+autoplot(mod2b)
+
+summary(mod2a)
+summary(mod2b)
+```
+
+mod2a has a higher rsq  and lower RSE = better
+both models show stat sig
+choose mod2a
+
+comparing with mod1a:
+Residual standard error was 39.6, is now 39.34
+Multiple R-squared was 0.02118, is now 0.03431
+delayed_dep = intercept + dewpoint + wind_speed
+delayed_dep = -17.735 + 0.400*dewpoint + 1.266*wind_speed
+
+examine remaining assoc with residuals
+```{r message=FALSE, warning=FALSE}
+flights_weather_lr_resids <- flights_weather_lr_trim %>% 
+  add_residuals(mod2a) %>% 
+  select(-c(dep_delay, dewp, wind_speed))
+
+flights_weather_lr_resids %>% 
+  ggpairs()
+```
+
+precipitation and humidity
+
+```{r}
+mod3a <- lm(dep_delay ~ dewp + wind_speed + precip, data = flights_weather_lr_trim)
+mod3b <- lm(dep_delay ~ dewp + wind_speed + humid, data = flights_weather_lr_trim)
+
+autoplot(mod3a)
+autoplot(mod3b)
+
+summary(mod3a)
+summary(mod3b)
+```
+
+all coeff are sig
+mod3a has a lower rse and high r.sq so is better
+
+delayed_dep = intercept + dewpoint + wind_speed + precip
+delayed_dep = -16.271 + 0.357*dewp + 1.242*wind_speed + 160.127*precip
+
+```{r}
+n_data <- nrow(flights_weather_lr_trim)
+
+test_index <- sample(1:n_data, size = n_data*0.2)
+
+test_linr <- slice(flights_weather_lr_trim, test_index)
+
+train_linr <- slice(flights_weather_lr_trim, -test_index)
+```
+
+```{r}
+
+mod3a_train <- lm(dep_delay ~ dewp + wind_speed + precip, data = train_linr)
+
+predictions_test_linr <- test_linr %>% 
+  add_predictions(mod3a_train) %>% 
+  select(dep_delay, pred)
+
+predictions_train_linr <- train_linr %>% 
+  add_predictions(mod3a_train) %>% 
+  select(dep_delay, pred)
+```
+
+```{r}
+mse_test <- mean((predictions_test_linr$pred - test_linr$dep_delay)^2)
+mse_test
+
+mse_train <- mean((predictions_train_linr$pred - train_linr$dep_delay)^2)
+mse_train
+```
+The error is lower on the train data which you would expect as it was used to train the model
+
+```{r}
+plotModel(mod3a)
+```
+```{r}
+glance(mod3a)
+```
+# 3. What other factors affect departure delays?
+
+logical (delayed 1/0) model of other factos
+
+linear (delay length) model of other factors
+
+dest routes compared with other airports
+
+other ideas:
+plane age - does this cause more delays? do other airports have younger/older planes that affect delays
+airlines - what ones have more delays - are their planes older?
+
+## predictive log model of other factors vs 1/0 delayed
+(for EWR only)
+
+
+```{r}
+flights_planes_trim <- flights_planes_trim %>% 
+  filter(origin == "EWR") %>% 
+  select(-dep_delay) %>% 
+  mutate(across(c("carrier":"engine"), ~as.factor(.x)))
+
+glimpse(flights_planes_trim)
+
+summarise(flights_planes_trim, across(everything(), ~ sum(is.na(.))))
+```
+```{r}
+#alias(lm(delayed_dep ~., data = flights_planes_trim))
+```
+
+
+```{r}
+n_data_other_delay <- nrow(flights_planes_trim)
+
+other_delay_test_index <- sample(1:n_data_other_delay, size = n_data_other_delay*0.2)
+
+other_delay_test <- slice(flights_planes_trim, other_delay_test_index)
+
+other_delay_train <- slice(flights_planes_trim, -other_delay_test_index)
+```
+
+```{r}
+other_delay_test %>%  janitor::tabyl(delayed_dep)
+
+other_delay_train %>% janitor::tabyl(delayed_dep)
+```
+```{r}
+rf_other_delay_classifier <- ranger(delayed_dep ~ .,
+                                    data = other_delay_train,
+                                    importance = "impurity",
+                                    num.trees = 1000,
+                                    min.node.size = 10)
+
+rf_other_delay_classifier
+```
+
+```{r}
+sort(importance(rf_other_delay_classifier), decreasing = TRUE)
+```
+
+month > carrier > manufacturer > distance > age group
+
+
+
+```{r}
+rf_other_delay_classifier_pred <- other_delay_test %>% 
+  drop_na(delayed_dep) %>% 
+  mutate(pred = as.logical(predict(rf_other_delay_classifier, data = other_delay_test)$predictions),
+         pred = as.factor(pred),
+         delayed_dep = as.factor(delayed_dep))
+
+
+```
+
+```{r}
+confusionMatrix(rf_other_delay_classifier_pred$pred, rf_other_delay_classifier_pred$delayed_dep)
+```
+
+```{r}
+other_cf_tibble <- tibble(delay = c("Delayed","Delayed","Not Delayed", "Not Delayed"),
+                          predicted = c("Correct", "Incorrect", "Correct", "Incorrect"),
+                          count = c(4002, 3985, 10926, 1681))
+other_cf_tibble %>% 
+  
+  ggplot(aes(x = delay, y = count, fill = predicted)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Correct" = "darkturquoise", "Incorrect" = "darkgreen")) +
+  labs(x = "",
+       y = "Count",
+       title = "Model Prediction Performance")
+
+ggsave("other_model.png", height = 5, width = 7)
+```
+
+
+```{r}
+roc_obj_other <- rf_other_delay_classifier_pred %>% 
+  mutate(pred = if_else(pred == TRUE, 1, 0)) %>% 
+  roc(response = delayed_dep, predictor = pred)
+
+roc_curve_other <- ggroc(data = roc_obj_other, legacy.axes = TRUE) +
+  coord_fixed() +
+  ylab("Sensitivity (TPR)") +
+  xlab("1-specificity (TNR)")
+
+roc_curve_other
+
+
+```
+```{r}
+auc(roc_obj_other)
+```
+```{r}
+gini = 2 * 0.6839 - 1
+
+gini
+```
+
+
+
+```{r}
+(airport_map <- airports %>%
+   filter(faa %in% c("EWR", "JFK", "LGA")) %>% 
+   leaflet() %>% 
+   addTiles() %>% 
+   addPopups(lng = ~ lon,
+             lat = ~ lat,
+             popup = ~ name)
+)
+
+
+```
+
+
+```{r}
+weather %>% 
+  filter(origin == "EWR") %>% 
+  summarise(avg = mean(humid, na.rm = TRUE))
+```
+```{r}
+flights %>% 
+  filter(origin == "EWR") %>% 
+  nrow()
+```
+
+
